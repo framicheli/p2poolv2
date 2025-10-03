@@ -69,21 +69,31 @@ fn check_session_timeouts<D: DifficultyAdjusterTrait>(
     timeouts: &SessionTimeouts,
 ) -> Option<TimeoutReason> {
     let now = Instant::now();
+
+    // Handshake Timeout
+    // Disconnect clients that aren't subscribed and authorized
     if !(session.subscribed && session.authorized) {
         let since_connect = now.duration_since(session.connected_at);
-        let since_message = now.duration_since(session.last_message_time.unwrap()); // <------------------ Very bad!
-        if since_connect >= timeouts.handshake_timeout
-            && since_message >= timeouts.handshake_timeout
+
+        let since_last_activity = session
+            .last_message_time // Use last_message_time
+            .map(|t| now.duration_since(t))
+            .unwrap_or(since_connect); // otherwise connected_at
+
+        // Disconnect if client connected but hasn't completed handshake for more than handshake_timeout time
+        if since_last_activity >= timeouts.handshake_timeout
+            || since_connect >= timeouts.handshake_timeout
         {
             return Some(TimeoutReason::Handshake);
         }
     }
 
+    // Inactivity timeout
+    // Disconnect authorized clients that haven't submitted shares recently
     if session.authorized
         && session.has_submitted_share
-
-        // also bad!
-        && now.duration_since(session.last_share_time.unwrap()) >= timeouts.inactivity_timeout
+        && let Some(last_share_time) = session.last_share_time
+        && now.duration_since(last_share_time) >= timeouts.inactivity_timeout
     {
         return Some(TimeoutReason::Inactivity);
     }

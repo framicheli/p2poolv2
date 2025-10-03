@@ -92,8 +92,8 @@ impl<D: DifficultyAdjusterTrait> Session<D> {
             version_mask,
             suggested_difficulty: None,
             connected_at: now,
-            last_message_time: Some(now),
-            last_share_time: Some(now),
+            last_message_time: Some(now), // Initialize at connection time
+            last_share_time: None,        // Only when the share is sent
             has_submitted_share: false,
         }
     }
