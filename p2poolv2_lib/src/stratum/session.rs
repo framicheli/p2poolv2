@@ -92,8 +92,8 @@ impl<D: DifficultyAdjusterTrait> Session<D> {
             version_mask,
             suggested_difficulty: None,
             connected_at: now,
-            last_message_time: Some(now), // Initialize at connection time
-            last_share_time: None,        // Only when the share is sent
+            last_message_time: Some(now),
+            last_share_time: None,
             has_submitted_share: false,
         }
     }
@@ -164,9 +164,7 @@ mod tests {
         assert!(!session.subscribed);
         assert!(!session.authorized);
         assert!(!session.has_submitted_share);
-
-        //assert!(session.last_message_time >= session.connected_at);
-        //assert!(session.last_share_time >= session.connected_at);
+        assert!(session.connected_at == session.last_message_time.unwrap());
     }
 
     #[test]
