@@ -527,6 +527,8 @@ mod tests {
                 network: bitcoin::network::Network::Signet,
                 version_mask: 0x1fffe000,
                 difficulty_multiplier: 1.0,
+                handshake_timeout: Some(900),
+                inactivity_timeout: Some(900),
             },
             miner: MinerConfig {
                 pubkey: "020202020202020202020202020202020202020202020202020202020202020202"

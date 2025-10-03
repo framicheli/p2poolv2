@@ -23,6 +23,7 @@ use crate::stratum::session::Session;
 use crate::stratum::validate_username;
 use crate::stratum::work::notify::NotifyCmd;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 /// Register user and worker in the store and update session with their IDs
@@ -92,6 +93,10 @@ pub(crate) async fn handle_authorize<'a, D: DifficultyAdjusterTrait>(
     session.btcaddress = Some(parsed_username.0.to_string());
     session.workername = parsed_username.1.map(|s| s.to_string());
     session.password = message.params[1].clone();
+    session.authorized = true;
+    let now = Instant::now();
+    session.last_message_time = Some(now);
+    session.last_share_time = Some(now);
 
     // Register user and worker in the store
     register_user_worker(session, parsed_username.0, parsed_username.1, ctx.store)?;

@@ -44,6 +44,12 @@ pub struct StratumConfig {
     pub version_mask: i32,
     /// The difficulty multiplier for dynamic difficulty adjustment
     pub difficulty_multiplier: f64,
+    /// Optional timeout to complete subscribe+authorize handshake
+    #[serde(default)]
+    pub handshake_timeout: Option<u64>,
+    /// Optional inactivity timeout after last share submission
+    #[serde(default)]
+    pub inactivity_timeout: Option<u64>,
 }
 
 /// helper function to deserialize the network from the config file, which is provided as a string like Core
@@ -214,6 +220,16 @@ impl Config {
 
     pub fn with_stratum_bootstrap_address(mut self, bootstrap_address: String) -> Self {
         self.stratum.bootstrap_address = bootstrap_address;
+        self
+    }
+
+    pub fn with_stratum_handshake_timeout(mut self, secs: u64) -> Self {
+        self.stratum.handshake_timeout = Some(secs);
+        self
+    }
+
+    pub fn with_stratum_inactivity_timeout(mut self, secs: u64) -> Self {
+        self.stratum.inactivity_timeout = Some(secs);
         self
     }
 

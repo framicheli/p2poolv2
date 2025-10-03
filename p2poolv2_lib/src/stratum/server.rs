@@ -32,9 +32,11 @@ use crate::stratum::work::tracker::TrackerHandle;
 use bitcoindrpc::BitcoinRpcConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{self, MissedTickBehavior};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, error, info};
@@ -53,6 +55,40 @@ pub struct StratumServer {
     connections_handle: ClientConnectionsHandle,
     shares_tx: mpsc::Sender<SimplePplnsShare>,
     store: Arc<ChainStore>,
+    timeouts: SessionTimeouts,
+}
+
+#[derive(Clone, Copy)]
+enum TimeoutReason {
+    Handshake,
+    Inactivity,
+}
+
+fn check_session_timeouts<D: DifficultyAdjusterTrait>(
+    session: &Session<D>,
+    timeouts: &SessionTimeouts,
+) -> Option<TimeoutReason> {
+    let now = Instant::now();
+    if !(session.subscribed && session.authorized) {
+        let since_connect = now.duration_since(session.connected_at);
+        let since_message = now.duration_since(session.last_message_time.unwrap()); // <------------------ Very bad!
+        if since_connect >= timeouts.handshake_timeout
+            && since_message >= timeouts.handshake_timeout
+        {
+            return Some(TimeoutReason::Handshake);
+        }
+    }
+
+    if session.authorized
+        && session.has_submitted_share
+
+        // also bad!
+        && now.duration_since(session.last_share_time.unwrap()) >= timeouts.inactivity_timeout
+    {
+        return Some(TimeoutReason::Inactivity);
+    }
+
+    None
 }
 
 /// Builder for StratumServer to avoid dependency on StratumConfig
@@ -70,6 +106,42 @@ pub struct StratumServerBuilder {
     shares_tx: Option<mpsc::Sender<SimplePplnsShare>>,
     zmqpubhashblock: Option<String>,
     store: Option<Arc<ChainStore>>,
+    handshake_timeout: Option<Duration>,
+    inactivity_timeout: Option<Duration>,
+    monitor_interval: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SessionTimeouts {
+    pub handshake_timeout: Duration,
+    pub inactivity_timeout: Duration,
+    pub monitor_interval: Duration,
+}
+
+impl SessionTimeouts {
+    fn default_handshake_timeout() -> Duration {
+        Duration::from_secs(900)
+    }
+
+    fn default_inactivity_timeout() -> Duration {
+        Duration::from_secs(900)
+    }
+
+    fn default_monitor_interval() -> Duration {
+        Duration::from_secs(10)
+    }
+
+    fn new(
+        handshake_timeout: Option<Duration>,
+        inactivity_timeout: Option<Duration>,
+        monitor_interval: Option<Duration>,
+    ) -> Self {
+        Self {
+            handshake_timeout: handshake_timeout.unwrap_or_else(Self::default_handshake_timeout),
+            inactivity_timeout: inactivity_timeout.unwrap_or_else(Self::default_inactivity_timeout),
+            monitor_interval: monitor_interval.unwrap_or_else(Self::default_monitor_interval),
+        }
+    }
 }
 
 impl StratumServerBuilder {
@@ -133,6 +205,21 @@ impl StratumServerBuilder {
         self
     }
 
+    pub fn handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+        self.handshake_timeout = Some(handshake_timeout);
+        self
+    }
+
+    pub fn inactivity_timeout(mut self, inactivity_timeout: Duration) -> Self {
+        self.inactivity_timeout = Some(inactivity_timeout);
+        self
+    }
+
+    pub fn monitor_interval(mut self, monitor_interval: Duration) -> Self {
+        self.monitor_interval = Some(monitor_interval);
+        self
+    }
+
     pub async fn build(self) -> Result<StratumServer, Box<dyn std::error::Error + Send + Sync>> {
         Ok(StratumServer {
             hostname: self.hostname.ok_or("hostname is required")?,
@@ -154,6 +241,11 @@ impl StratumServerBuilder {
                 .ok_or("connections_handle is required")?,
             shares_tx: self.shares_tx.ok_or("shares_tx is required")?,
             store: self.store.ok_or("store is required")?,
+            timeouts: SessionTimeouts::new(
+                self.handshake_timeout,
+                self.inactivity_timeout,
+                self.monitor_interval,
+            ),
         })
     }
 }
@@ -216,10 +308,23 @@ impl StratumServer {
                                 store: self.store.clone(),
                             };
                             let version_mask = self.version_mask;
+                            let timeouts = self.timeouts;
                             // Spawn a new task for each connection
                             tokio::spawn(async move {
                                 // Handle the connection with graceful shutdown support
-                                if handle_connection(buf_reader, writer, addr, message_rx, shutdown_rx, version_mask, ctx).await.is_err() {
+                                if handle_connection(
+                                    buf_reader,
+                                    writer,
+                                    addr,
+                                    message_rx,
+                                    shutdown_rx,
+                                    version_mask,
+                                    ctx,
+                                    timeouts,
+                                )
+                                .await
+                                .is_err()
+                                {
                                         error!("Error occurred while handling connection {addr}. Closing connection.");
                                 }
                             });
@@ -262,6 +367,7 @@ async fn handle_connection<R, W>(
     mut shutdown_rx: oneshot::Receiver<()>,
     version_mask: i32,
     ctx: StratumContext,
+    timeouts: SessionTimeouts,
 ) -> Result<(), Box<dyn std::error::Error + Send>>
 where
     R: AsyncBufReadExt + Unpin,
@@ -278,6 +384,9 @@ where
         ctx.maximum_difficulty,
         version_mask,
     );
+    let mut monitor = time::interval(timeouts.monitor_interval);
+    monitor.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    monitor.tick().await;
 
     // Process each line as it arrives
     loop {
@@ -310,6 +419,7 @@ where
                         if line.is_empty() {
                             continue; // Ignore empty lines
                         }
+                        session.last_message_time = Some(Instant::now());
                         if let Err(e) = process_incoming_message(
                             &line,
                             &mut writer,
@@ -329,6 +439,19 @@ where
                         info!("Connection closed by client: {}", addr);
                         break; // End of stream
                     }
+                }
+            }
+            _ = monitor.tick() => {
+                if let Some(reason) = check_session_timeouts(session, &timeouts) {
+                    match reason {
+                        TimeoutReason::Handshake => {
+                            info!("Disconnecting {addr} for incomplete handshake after connecting");
+                        }
+                        TimeoutReason::Inactivity => {
+                            info!("Disconnecting {addr} for inactivity");
+                        }
+                    }
+                    break; // Exit the loop and close the connection
                 }
             }
         }
@@ -410,7 +533,16 @@ mod stratum_server_tests {
     use bitcoindrpc::test_utils::setup_mock_bitcoin_rpc;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    fn default_timeouts() -> SessionTimeouts {
+        SessionTimeouts {
+            handshake_timeout: Duration::from_secs(60),
+            inactivity_timeout: Duration::from_secs(60),
+            monitor_interval: Duration::from_millis(100),
+        }
+    }
 
     #[tokio::test]
     async fn test_create_and_start_server() {
@@ -531,6 +663,7 @@ mod stratum_server_tests {
             shutdown_rx,
             0x1fffe000,
             ctx,
+            default_timeouts(),
         )
         .await;
 
@@ -647,6 +780,7 @@ mod stratum_server_tests {
             shutdown_rx,
             0x1fffe000,
             ctx,
+            default_timeouts(),
         )
         .await;
 
@@ -717,6 +851,7 @@ mod stratum_server_tests {
             shutdown_rx,
             0x1fffe000,
             ctx,
+            default_timeouts(),
         )
         .await;
 
@@ -792,6 +927,7 @@ mod stratum_server_tests {
             shutdown_rx,
             0x1fffe000,
             ctx,
+            default_timeouts(),
         )
         .await;
 
@@ -890,6 +1026,7 @@ mod stratum_server_tests {
                 shutdown_rx,
                 0x1fffe000,
                 ctx,
+                default_timeouts(),
             )
             .await;
 
@@ -1004,6 +1141,7 @@ mod stratum_server_tests {
                 shutdown_rx,
                 0x1fffe000,
                 ctx,
+                default_timeouts(),
             )
             .await;
 

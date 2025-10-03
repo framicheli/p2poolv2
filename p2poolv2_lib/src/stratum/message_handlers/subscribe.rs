@@ -19,6 +19,7 @@ use crate::stratum::error::Error;
 use crate::stratum::messages::{Message, Response, SetDifficultyNotification, SimpleRequest};
 use crate::stratum::session::{EXTRANONCE2_SIZE, Session};
 use serde_json::json;
+use std::time::Instant;
 use tracing::debug;
 
 /// Handle the "mining.subscribe" message
@@ -37,6 +38,7 @@ pub async fn handle_subscribe<'a, D: DifficultyAdjusterTrait>(
         return Err(Error::SubscriptionFailure("Already subscribed".to_string()));
     }
     session.subscribed = true;
+    session.last_message_time = Some(Instant::now());
     session
         .difficulty_adjuster
         .set_current_difficulty(start_difficulty);

@@ -31,6 +31,7 @@ use p2poolv2_lib::stratum::work::tracker::start_tracker_actor;
 use p2poolv2_lib::stratum::zmq_listener::{ZmqListener, ZmqListenerTrait};
 use std::process::exit;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::error;
 use tracing::info;
 
@@ -158,7 +159,7 @@ async fn main() -> Result<(), String> {
     let store_for_stratum = chain_store.clone();
 
     tokio::spawn(async move {
-        let mut stratum_server = StratumServerBuilder::default()
+        let mut builder = StratumServerBuilder::default()
             .shutdown_rx(stratum_shutdown_rx)
             .connections_handle(connections_handle.clone())
             .shares_tx(shares_tx)
@@ -169,7 +170,16 @@ async fn main() -> Result<(), String> {
             .maximum_difficulty(stratum_config.maximum_difficulty)
             .network(stratum_config.network)
             .version_mask(stratum_config.version_mask)
-            .store(store_for_stratum)
+            .store(store_for_stratum);
+
+        if let Some(secs) = stratum_config.handshake_timeout {
+            builder = builder.handshake_timeout(Duration::from_secs(secs));
+        }
+        if let Some(secs) = stratum_config.inactivity_timeout {
+            builder = builder.inactivity_timeout(Duration::from_secs(secs));
+        }
+
+        let mut stratum_server = builder
             .build()
             .await
             .unwrap();
