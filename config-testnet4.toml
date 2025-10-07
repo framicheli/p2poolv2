@@ -31,6 +31,7 @@ start_difficulty = 1
 minimum_difficulty = 1
 handshake_timeout = 900
 inactivity_timeout = 900
+monitor_interval = 10
 solo_address = "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk"
 zmqpubhashblock = "tcp://127.0.0.1:28332"
 # The network can be "main", "testnet4" or "signet"

@@ -41,6 +41,71 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, error, info};
 
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TimeoutReason {
+    Handshake,
+    Inactivity,
+}
+
+#[derive(Clone, Copy)]
+pub struct SessionTimeouts {
+    pub handshake_timeout: Duration,
+    pub inactivity_timeout: Duration,
+    pub monitor_interval: Duration,
+}
+
+impl SessionTimeouts {
+
+    fn default() -> Self {
+        Self { 
+            handshake_timeout: Duration::from_secs(900),    // 15 minutes
+            inactivity_timeout: Duration::from_secs(900),   // 15 minutes
+            monitor_interval: Duration::from_secs(10)
+        }
+    }
+
+    fn new() -> Self {
+        // TODO: get data from the config.toml file
+        Self {
+            handshake_timeout: Duration::from_secs(900),
+            inactivity_timeout: Duration::from_secs(900),
+            monitor_interval: Duration::from_secs(10)
+        }
+    }
+}
+
+fn check_session_timeouts(session: &Session<DifficultyAdjuster>, timeouts: &SessionTimeouts) -> Option<TimeoutReason> {
+    let now = Instant::now();
+    if !(session.subscribed && session.authorized) {
+        
+        let since_connect = now.duration_since(session.connected_at);
+        
+        let lmt = match session.last_message_time {
+            Some(lmt) => lmt,
+            None => session.connected_at
+        };
+        let since_message = now.duration_since(lmt);
+        if since_connect >= timeouts.handshake_timeout && since_message >= timeouts.handshake_timeout {
+            return Some(TimeoutReason::Handshake);
+        }
+    }
+
+    let lst = match session.last_share_time {
+        Some(val) => val,
+        None => session.connected_at,
+    };
+    let since_last_share = now.duration_since(lst);
+    if session.authorized
+        && session.has_submitted_share
+        && since_last_share >= timeouts.inactivity_timeout
+    {
+        return Some(TimeoutReason::Inactivity);
+    }
+
+    None
+}
+
 // A struct to represent a Stratum server configuration
 // This struct contains the port and address of the Stratum server
 pub struct StratumServer {
@@ -58,50 +123,7 @@ pub struct StratumServer {
     timeouts: SessionTimeouts,
 }
 
-#[derive(Clone, Copy)]
-enum TimeoutReason {
-    Handshake,
-    Inactivity,
-}
 
-fn check_session_timeouts<D: DifficultyAdjusterTrait>(
-    session: &Session<D>,
-    timeouts: &SessionTimeouts,
-) -> Option<TimeoutReason> {
-    let now = Instant::now();
-
-    // Handshake Timeout
-    // Disconnect clients that aren't subscribed and authorized
-    if !(session.subscribed && session.authorized) {
-        let since_connect = now.duration_since(session.connected_at);
-
-        let since_last_activity = session
-            .last_message_time // Use last_message_time
-            .map(|t| now.duration_since(t))
-            .unwrap_or(since_connect); // otherwise connected_at
-
-        // Disconnect if client connected but hasn't completed handshake for more than handshake_timeout time
-        if since_last_activity >= timeouts.handshake_timeout
-            || since_connect >= timeouts.handshake_timeout
-        {
-            return Some(TimeoutReason::Handshake);
-        }
-    }
-
-    // Inactivity timeout
-    // Disconnect authorized clients that haven't submitted shares recently
-    if session.authorized
-        && session.has_submitted_share
-        && let Some(last_share_time) = session.last_share_time
-        && now.duration_since(last_share_time) >= timeouts.inactivity_timeout
-    {
-        return Some(TimeoutReason::Inactivity);
-    }
-
-    None
-}
-
-/// Builder for StratumServer to avoid dependency on StratumConfig
 #[derive(Default)]
 pub struct StratumServerBuilder {
     hostname: Option<String>,
@@ -119,39 +141,6 @@ pub struct StratumServerBuilder {
     handshake_timeout: Option<Duration>,
     inactivity_timeout: Option<Duration>,
     monitor_interval: Option<Duration>,
-}
-
-#[derive(Clone, Copy)]
-pub struct SessionTimeouts {
-    pub handshake_timeout: Duration,
-    pub inactivity_timeout: Duration,
-    pub monitor_interval: Duration,
-}
-
-impl SessionTimeouts {
-    fn default_handshake_timeout() -> Duration {
-        Duration::from_secs(900)
-    }
-
-    fn default_inactivity_timeout() -> Duration {
-        Duration::from_secs(900)
-    }
-
-    fn default_monitor_interval() -> Duration {
-        Duration::from_secs(10)
-    }
-
-    fn new(
-        handshake_timeout: Option<Duration>,
-        inactivity_timeout: Option<Duration>,
-        monitor_interval: Option<Duration>,
-    ) -> Self {
-        Self {
-            handshake_timeout: handshake_timeout.unwrap_or_else(Self::default_handshake_timeout),
-            inactivity_timeout: inactivity_timeout.unwrap_or_else(Self::default_inactivity_timeout),
-            monitor_interval: monitor_interval.unwrap_or_else(Self::default_monitor_interval),
-        }
-    }
 }
 
 impl StratumServerBuilder {
@@ -252,9 +241,9 @@ impl StratumServerBuilder {
             shares_tx: self.shares_tx.ok_or("shares_tx is required")?,
             store: self.store.ok_or("store is required")?,
             timeouts: SessionTimeouts::new(
-                self.handshake_timeout,
-                self.inactivity_timeout,
-                self.monitor_interval,
+                // self.handshake_timeout,
+                // self.inactivity_timeout,
+                // self.monitor_interval,
             ),
         })
     }
@@ -540,11 +529,15 @@ mod stratum_server_tests {
     use crate::stratum::messages::SimpleRequest;
     use crate::stratum::server;
     use crate::stratum::work::tracker::start_tracker_actor;
+    use crate::stratum::work::notify::NotifyCmd;
     use bitcoindrpc::test_utils::setup_mock_bitcoin_rpc;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
     use std::time::Duration;
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio::io;
+    use crate::stratum::session::Session;
+    use crate::stratum::difficulty_adjuster::DifficultyAdjuster;
 
     fn default_timeouts() -> SessionTimeouts {
         SessionTimeouts {
@@ -552,6 +545,56 @@ mod stratum_server_tests {
             inactivity_timeout: Duration::from_secs(60),
             monitor_interval: Duration::from_millis(100),
         }
+    }
+
+    #[test]
+    fn test_check_session_timeouts_handshake_timeout() {
+        let mut session = Session::<DifficultyAdjuster>::new(100, 2000, Some(3000), 0x1fffe000);
+        let timeouts = SessionTimeouts {
+            handshake_timeout: Duration::from_secs(900),
+            inactivity_timeout: Duration::from_secs(900),
+            monitor_interval: Duration::from_millis(100),
+        };
+        let now = session.connected_at + Duration::from_secs(15);
+
+        let reason = check_session_timeouts(&session, &timeouts);
+        assert_eq!(reason, Some(TimeoutReason::Handshake));
+    }
+
+    #[test]
+    fn test_check_session_timeouts_inactivity_timeout() {
+        let mut session = Session::<DifficultyAdjuster>::new(100, 2000, Some(3000), 0x1fffe000);
+        session.subscribed = true;
+        session.authorized = true;
+        session.has_submitted_share = true;
+        session.last_share_time = Some(Instant::now());
+        let timeouts = SessionTimeouts {
+            handshake_timeout: Duration::from_secs(60),
+            inactivity_timeout: Duration::from_secs(10),
+            monitor_interval: Duration::from_millis(100),
+        };
+        let now = session.last_share_time.unwrap() + Duration::from_secs(15);
+
+        let reason = check_session_timeouts(&session, &timeouts);
+        assert_eq!(reason, Some(TimeoutReason::Inactivity));
+    }
+
+    #[test]
+    fn test_check_session_timeouts_no_timeout() {
+        let mut session = Session::<DifficultyAdjuster>::new(100, 2000, Some(3000), 0x1fffe000);
+        session.subscribed = true;
+        session.authorized = true;
+        session.has_submitted_share = true;
+        session.last_share_time = Some(Instant::now());
+        let timeouts = SessionTimeouts {
+            handshake_timeout: Duration::from_secs(60),
+            inactivity_timeout: Duration::from_secs(900),
+            monitor_interval: Duration::from_millis(100),
+        };
+        let now = session.last_share_time.unwrap() + Duration::from_secs(100);
+
+        let reason = check_session_timeouts(&session, &timeouts);
+        assert_eq!(reason, None);
     }
 
     #[tokio::test]
@@ -1199,4 +1242,71 @@ mod stratum_server_tests {
             "Subscribe response should have 'result' field"
         );
     }
+
+    #[tokio::test]
+    async fn test_handle_connection_handshake_timeout_integration() {
+        tokio::time::pause();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let mut writer = Vec::new();
+        let (_, message_rx) = mpsc::channel(10);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (notify_tx, _notify_rx) = mpsc::channel(10);
+        let tracker_handle = start_tracker_actor();
+        let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
+        let (shares_tx, _shares_rx) = mpsc::channel(10);
+        let stats_dir = tempfile::tempdir().unwrap();
+        let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
+            .await
+            .unwrap();
+
+        let temp_dir = tempdir().unwrap();
+        let store = Arc::new(ChainStore::new(
+            Arc::new(Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap()),
+            ShareBlock::build_genesis_for_network(bitcoin::Network::Signet),
+        ));
+
+        let ctx = StratumContext {
+            notify_tx,
+            tracker_handle,
+            bitcoinrpc_config,
+            metrics: metrics_handle,
+            start_difficulty: 10000,
+            minimum_difficulty: 1,
+            maximum_difficulty: Some(2),
+            shares_tx,
+            network: bitcoin::network::Network::Regtest,
+            store,
+        };
+
+        let timeouts = SessionTimeouts {
+            handshake_timeout: Duration::from_secs(1),
+            inactivity_timeout: Duration::from_secs(900),
+            monitor_interval: Duration::from_millis(100),
+        };
+
+        let reader = BufReader::new(io::empty());
+
+        let handle = tokio::spawn(async move {
+            let result = handle_connection(
+                reader,
+                &mut writer,
+                addr,
+                message_rx,
+                shutdown_rx,
+                0x1fffe000,
+                ctx,
+                timeouts,
+            )
+            .await;
+            result
+        });
+
+        // Advance time beyond handshake timeout
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        // The task should have completed (disconnected)
+        let result = handle.await.unwrap();
+        assert!(result.is_ok()); // Connection closed due to timeout
+    }
+
 }
