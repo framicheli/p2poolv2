@@ -57,16 +57,8 @@ pub struct SessionTimeouts {
 
 impl SessionTimeouts {
 
-    fn default() -> Self {
-        Self { 
-            handshake_timeout: Duration::from_secs(900),    // 15 minutes
-            inactivity_timeout: Duration::from_secs(900),   // 15 minutes
-            monitor_interval: Duration::from_secs(10)
-        }
-    }
-
     fn new() -> Self {
-        // TODO: get data from the config.toml file
+        // TODO: get data from the config toml files
         Self {
             handshake_timeout: Duration::from_secs(900),
             inactivity_timeout: Duration::from_secs(900),
@@ -120,7 +112,6 @@ pub struct StratumServer {
     connections_handle: ClientConnectionsHandle,
     shares_tx: mpsc::Sender<SimplePplnsShare>,
     store: Arc<ChainStore>,
-    timeouts: SessionTimeouts,
 }
 
 
@@ -240,11 +231,6 @@ impl StratumServerBuilder {
                 .ok_or("connections_handle is required")?,
             shares_tx: self.shares_tx.ok_or("shares_tx is required")?,
             store: self.store.ok_or("store is required")?,
-            timeouts: SessionTimeouts::new(
-                // self.handshake_timeout,
-                // self.inactivity_timeout,
-                // self.monitor_interval,
-            ),
         })
     }
 }
@@ -307,7 +293,6 @@ impl StratumServer {
                                 store: self.store.clone(),
                             };
                             let version_mask = self.version_mask;
-                            let timeouts = self.timeouts;
                             // Spawn a new task for each connection
                             tokio::spawn(async move {
                                 // Handle the connection with graceful shutdown support
@@ -319,7 +304,6 @@ impl StratumServer {
                                     shutdown_rx,
                                     version_mask,
                                     ctx,
-                                    timeouts,
                                 )
                                 .await
                                 .is_err()
@@ -365,13 +349,13 @@ async fn handle_connection<R, W>(
     mut message_rx: mpsc::Receiver<Arc<String>>,
     mut shutdown_rx: oneshot::Receiver<()>,
     version_mask: i32,
-    ctx: StratumContext,
-    timeouts: SessionTimeouts,
+    ctx: StratumContext
 ) -> Result<(), Box<dyn std::error::Error + Send>>
 where
     R: AsyncBufReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
+    let timeouts = SessionTimeouts::new();
     // Create a LinesCodec with a maximum line length of 8KB
     // This prevents potential DoS attacks with extremely long lines
     const MAX_LINE_LENGTH: usize = 8 * 1024; // 8KB
@@ -538,14 +522,6 @@ mod stratum_server_tests {
     use tokio::io;
     use crate::stratum::session::Session;
     use crate::stratum::difficulty_adjuster::DifficultyAdjuster;
-
-    fn default_timeouts() -> SessionTimeouts {
-        SessionTimeouts {
-            handshake_timeout: Duration::from_secs(60),
-            inactivity_timeout: Duration::from_secs(60),
-            monitor_interval: Duration::from_millis(100),
-        }
-    }
 
     #[test]
     fn test_check_session_timeouts_handshake_timeout() {
@@ -716,7 +692,6 @@ mod stratum_server_tests {
             shutdown_rx,
             0x1fffe000,
             ctx,
-            default_timeouts(),
         )
         .await;
 
@@ -833,7 +808,6 @@ mod stratum_server_tests {
             shutdown_rx,
             0x1fffe000,
             ctx,
-            default_timeouts(),
         )
         .await;
 
@@ -904,7 +878,6 @@ mod stratum_server_tests {
             shutdown_rx,
             0x1fffe000,
             ctx,
-            default_timeouts(),
         )
         .await;
 
@@ -980,7 +953,6 @@ mod stratum_server_tests {
             shutdown_rx,
             0x1fffe000,
             ctx,
-            default_timeouts(),
         )
         .await;
 
@@ -1079,7 +1051,6 @@ mod stratum_server_tests {
                 shutdown_rx,
                 0x1fffe000,
                 ctx,
-                default_timeouts(),
             )
             .await;
 
@@ -1194,7 +1165,6 @@ mod stratum_server_tests {
                 shutdown_rx,
                 0x1fffe000,
                 ctx,
-                default_timeouts(),
             )
             .await;
 
@@ -1278,11 +1248,6 @@ mod stratum_server_tests {
             store,
         };
 
-        let timeouts = SessionTimeouts {
-            handshake_timeout: Duration::from_secs(1),
-            inactivity_timeout: Duration::from_secs(900),
-            monitor_interval: Duration::from_millis(100),
-        };
 
         let reader = BufReader::new(io::empty());
 
@@ -1295,7 +1260,6 @@ mod stratum_server_tests {
                 shutdown_rx,
                 0x1fffe000,
                 ctx,
-                timeouts,
             )
             .await;
             result
