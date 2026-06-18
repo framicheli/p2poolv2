@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod auth;
+pub mod btcrpc;
 pub mod endpoints;
 pub mod error;
 pub mod server;

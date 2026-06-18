@@ -4,3 +4,4 @@
 
 pub mod api;
 pub use api::server::start_api_server;
+pub use api::server::start_btcrpc_server;
