@@ -55,7 +55,7 @@ use crate::shares::chain::chain_store_handle::MockChainStoreHandle;
 use crate::shares::coinbaseaux_flags::CoinbaseAuxFlags;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::shares::share_commitment::ShareCommitment;
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(test)]
 use crate::shares::witness_commitment::WitnessCommitment;
 #[cfg(test)]
 use crate::store::block_tx_metadata::{BlockMetadata, Status};
