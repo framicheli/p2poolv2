@@ -1,8 +1,9 @@
 == BitcoindRPC
 
 This crate is used by P2Poolv2 to make authenticated Bitcoin Core JSON-RPC
-calls. `BitcoindRpcClient::request` and `BitcoindRpcClient::call_value` are the
-generic call methods; they do not impose an RPC allowlist.
+calls. `BitcoindRpcClient::request`, `BitcoindRpcClient::call_value`, and
+`BitcoindRpcClient::call_value_for_wallet` are the generic call methods; they
+do not impose an RPC allowlist.
 
 Typed convenience methods currently provided by the client:
 
@@ -12,5 +13,5 @@ Typed convenience methods currently provided by the client:
 . getblocktemplate
 . submit_block (calls `submitblock`)
 
-The separate HTTP gateway has its own 16-method allowlist, documented in
-link:../docs/rpc/bitcoin-core-proxy.md[Bitcoin Core JSON-RPC gateway].
+The separate HTTP gateway has its own base and optional wallet allowlists,
+documented in link:../docs/rpc/bitcoin-core-proxy.md[Bitcoin Core JSON-RPC gateway].

@@ -1,23 +1,11 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -53,6 +41,22 @@ const ALLOWED_METHODS: [&str; 16] = [
     "decoderawtransaction",
 ];
 
+const WALLET_METHODS: [&str; 13] = [
+    "createrawtransaction",
+    "createwallet",
+    "getbalance",
+    "getbalances",
+    "gettransaction",
+    "getwalletinfo",
+    "importdescriptors",
+    "listunspent",
+    "listwallets",
+    "loadwallet",
+    "rescanblockchain",
+    "signrawtransactionwithwallet",
+    "unloadwallet",
+];
+
 const PARSE_ERROR: i32 = -32700;
 const INVALID_REQUEST: i32 = -32600;
 const METHOD_NOT_FOUND: i32 = -32601;
@@ -63,6 +67,7 @@ const INTERNAL_ERROR: i32 = -32603;
 struct BitcoinRpcState {
     client: BitcoindRpcClient,
     max_batch_size: usize,
+    wallet_rpc_enabled: bool,
     rpcuser: String,
     rpcpassword: String,
 }
@@ -136,6 +141,8 @@ fn bitcoind_error_to_rpc_error(error: BitcoindRpcError) -> RpcError {
 
 async fn handle_single(
     client: &BitcoindRpcClient,
+    wallet_rpc_enabled: bool,
+    wallet_name: Option<&str>,
     request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let version = RpcVersion::from_request(request);
@@ -155,7 +162,9 @@ async fn handle_single(
             },
         )
     } else if let Some(method) = request.get("method").and_then(serde_json::Value::as_str) {
-        if !ALLOWED_METHODS.contains(&method) {
+        if !ALLOWED_METHODS.contains(&method)
+            && !(wallet_rpc_enabled && WALLET_METHODS.contains(&method))
+        {
             make_error_response(
                 version,
                 id,
@@ -179,7 +188,15 @@ async fn handle_single(
                 )
             } else {
                 let params = request.get("params").cloned();
-                match client.call_value(method, params).await {
+                let result = match wallet_name {
+                    Some(wallet_name) => {
+                        client
+                            .call_value_for_wallet(method, params, wallet_name)
+                            .await
+                    }
+                    None => client.call_value(method, params).await,
+                };
+                match result {
                     Ok(result) => make_success_response(version, id, result),
                     Err(error) => {
                         make_error_response(version, id, bitcoind_error_to_rpc_error(error))
@@ -201,7 +218,11 @@ async fn handle_single(
     (!is_notification).then_some(response)
 }
 
-async fn bitcoin_rpc_handler(State(state): State<Arc<BitcoinRpcState>>, body: Bytes) -> Response {
+async fn handle_request_body(
+    state: Arc<BitcoinRpcState>,
+    wallet_name: Option<&str>,
+    body: Bytes,
+) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
@@ -251,7 +272,14 @@ async fn bitcoin_rpc_handler(State(state): State<Arc<BitcoinRpcState>>, body: By
             let mut responses = Vec::with_capacity(requests.len());
             // ponytail: use bounded concurrency if sequential batches become measurable.
             for request in requests {
-                if let Some(response) = handle_single(&state.client, request).await {
+                if let Some(response) = handle_single(
+                    &state.client,
+                    state.wallet_rpc_enabled,
+                    wallet_name,
+                    request,
+                )
+                .await
+                {
                     responses.push(response);
                 }
             }
@@ -261,11 +289,26 @@ async fn bitcoin_rpc_handler(State(state): State<Arc<BitcoinRpcState>>, body: By
                 Json(serde_json::Value::Array(responses)).into_response()
             }
         }
-        _ => match handle_single(&state.client, &value).await {
-            Some(response) => Json(response).into_response(),
-            None => StatusCode::NO_CONTENT.into_response(),
-        },
+        _ => {
+            match handle_single(&state.client, state.wallet_rpc_enabled, wallet_name, &value).await
+            {
+                Some(response) => Json(response).into_response(),
+                None => StatusCode::NO_CONTENT.into_response(),
+            }
+        }
     }
+}
+
+async fn bitcoin_rpc_handler(State(state): State<Arc<BitcoinRpcState>>, body: Bytes) -> Response {
+    handle_request_body(state, None, body).await
+}
+
+async fn bitcoin_wallet_rpc_handler(
+    State(state): State<Arc<BitcoinRpcState>>,
+    Path(wallet_name): Path<String>,
+    body: Bytes,
+) -> Response {
+    handle_request_body(state, Some(&wallet_name), body).await
 }
 
 fn constant_time_eq_str(left: &str, right: &str) -> bool {
@@ -342,9 +385,13 @@ fn build_router(state: Arc<BitcoinRpcState>) -> Router {
 }
 
 fn build_handler_router(state: Arc<BitcoinRpcState>) -> Router {
-    Router::new()
-        .route("/", post(bitcoin_rpc_handler))
-        .with_state(state)
+    let mut router = Router::new().route("/", post(bitcoin_rpc_handler));
+    if state.wallet_rpc_enabled {
+        router = router
+            .route("/wallet/{wallet_name}", post(bitcoin_wallet_rpc_handler))
+            .route("/wallet/{wallet_name}/", post(bitcoin_wallet_rpc_handler));
+    }
+    router.with_state(state)
 }
 
 /// Start the Bitcoin Core compatible JSON-RPC gateway on its own listener.
@@ -375,6 +422,7 @@ pub async fn start_bitcoin_rpc_server(
     let state = Arc::new(BitcoinRpcState {
         client,
         max_batch_size: config.max_batch_size,
+        wallet_rpc_enabled: config.wallet_rpc_enabled,
         rpcuser: config
             .rpcuser
             .expect("enabled bitcoin_rpc_api config was validated"),
@@ -428,6 +476,7 @@ mod tests {
     use axum::{body::Body, http};
     use base64::Engine;
     use std::env;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -468,6 +517,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -498,6 +548,374 @@ mod tests {
             assert_eq!(body["result"], true, "method {method_name} was rejected");
             assert!(body["error"].is_null(), "method {method_name} failed");
         }
+    }
+
+    #[tokio::test]
+    async fn wallet_methods_are_rejected_and_wallet_paths_are_absent_while_disabled() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let state = Arc::new(BitcoinRpcState {
+            client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
+            max_batch_size: 20,
+            wallet_rpc_enabled: false,
+            rpcuser: "unused".to_string(),
+            rpcpassword: "unused".to_string(),
+        });
+
+        let root_request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"method": "getbalance", "params": [], "id": 1}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let root_response = build_handler_router(state.clone())
+            .oneshot(root_request)
+            .await
+            .unwrap();
+        let root_body = axum::body::to_bytes(root_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let root_body: serde_json::Value = serde_json::from_slice(&root_body).unwrap();
+        assert_eq!(root_body["error"]["code"], METHOD_NOT_FOUND);
+
+        let wallet_request = http::Request::builder()
+            .method("POST")
+            .uri("/wallet/trading/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"method": "getbalance", "params": [], "id": 2}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let wallet_response = build_handler_router(state)
+            .oneshot(wallet_request)
+            .await
+            .unwrap();
+        assert_eq!(wallet_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn every_wallet_method_is_forwarded_when_enabled() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": true,
+                "error": null,
+                "id": 0
+            })))
+            .expect(13)
+            .mount(&mock_server)
+            .await;
+        let state = Arc::new(BitcoinRpcState {
+            client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
+            max_batch_size: 20,
+            wallet_rpc_enabled: true,
+            rpcuser: "unused".to_string(),
+            rpcpassword: "unused".to_string(),
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!([
+                    {"method": "createrawtransaction", "params": [], "id": 0},
+                    {"method": "createwallet", "params": [], "id": 1},
+                    {"method": "getbalance", "params": [], "id": 2},
+                    {"method": "getbalances", "params": [], "id": 3},
+                    {"method": "gettransaction", "params": [], "id": 4},
+                    {"method": "getwalletinfo", "params": [], "id": 5},
+                    {"method": "importdescriptors", "params": [], "id": 6},
+                    {"method": "listunspent", "params": [], "id": 7},
+                    {"method": "listwallets", "params": [], "id": 8},
+                    {"method": "loadwallet", "params": [], "id": 9},
+                    {"method": "rescanblockchain", "params": [], "id": 10},
+                    {"method": "signrawtransactionwithwallet", "params": [], "id": 11},
+                    {"method": "unloadwallet", "params": [], "id": 12}
+                ]))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = build_handler_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            json!([
+                {"result": true, "error": null, "id": 0},
+                {"result": true, "error": null, "id": 1},
+                {"result": true, "error": null, "id": 2},
+                {"result": true, "error": null, "id": 3},
+                {"result": true, "error": null, "id": 4},
+                {"result": true, "error": null, "id": 5},
+                {"result": true, "error": null, "id": 6},
+                {"result": true, "error": null, "id": 7},
+                {"result": true, "error": null, "id": 8},
+                {"result": true, "error": null, "id": 9},
+                {"result": true, "error": null, "id": 10},
+                {"result": true, "error": null, "id": 11},
+                {"result": true, "error": null, "id": 12}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_wallet_mode_preserves_root_and_wallet_endpoint_routing() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_json(json!({
+                "method": "getbalance",
+                "params": [],
+                "id": 0
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "root",
+                "error": null,
+                "id": 0
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/wallet/trading"))
+            .and(body_json(json!({
+                "method": "getblockcount",
+                "params": [],
+                "id": 1
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "wallet",
+                "error": null,
+                "id": 1
+            })))
+            .mount(&mock_server)
+            .await;
+        let state = Arc::new(BitcoinRpcState {
+            client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
+            max_batch_size: 20,
+            wallet_rpc_enabled: true,
+            rpcuser: "unused".to_string(),
+            rpcpassword: "unused".to_string(),
+        });
+
+        let root_request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"method": "getbalance", "params": [], "id": 10}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let root_response = build_handler_router(state.clone())
+            .oneshot(root_request)
+            .await
+            .unwrap();
+        let root_body = axum::body::to_bytes(root_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let root_body: serde_json::Value = serde_json::from_slice(&root_body).unwrap();
+        assert_eq!(root_body["result"], "root");
+
+        let wallet_request = http::Request::builder()
+            .method("POST")
+            .uri("/wallet/trading")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"method": "getblockcount", "params": [], "id": 11}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let wallet_response = build_handler_router(state)
+            .oneshot(wallet_request)
+            .await
+            .unwrap();
+        let wallet_body = axum::body::to_bytes(wallet_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let wallet_body: serde_json::Value = serde_json::from_slice(&wallet_body).unwrap();
+        assert_eq!(wallet_body["result"], "wallet");
+    }
+
+    #[tokio::test]
+    async fn wallet_name_is_forwarded_as_one_encoded_path_segment() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wallet/..%2Fhot%20wallet%25"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": true,
+                "error": null,
+                "id": 0
+            })))
+            .mount(&mock_server)
+            .await;
+        let state = Arc::new(BitcoinRpcState {
+            client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
+            max_batch_size: 20,
+            wallet_rpc_enabled: true,
+            rpcuser: "unused".to_string(),
+            rpcpassword: "unused".to_string(),
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/wallet/..%2Fhot%20wallet%25/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"method": "getwalletinfo", "params": [], "id": 1}))
+                    .unwrap(),
+            ))
+            .unwrap();
+
+        let response = build_handler_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"], true);
+    }
+
+    #[tokio::test]
+    async fn wallet_endpoint_forwards_positional_and_named_parameters_unchanged() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wallet/trading"))
+            .and(body_json(json!({
+                "method": "listunspent",
+                "params": [1, 6],
+                "id": 0
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "positional",
+                "error": null,
+                "id": 0
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/wallet/trading"))
+            .and(body_json(json!({
+                "method": "listunspent",
+                "params": {"minconf": 1, "maxconf": 6},
+                "id": 1
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "named",
+                "error": null,
+                "id": 1
+            })))
+            .mount(&mock_server)
+            .await;
+        let state = Arc::new(BitcoinRpcState {
+            client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
+            max_batch_size: 20,
+            wallet_rpc_enabled: true,
+            rpcuser: "unused".to_string(),
+            rpcpassword: "unused".to_string(),
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/wallet/trading/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!([
+                    {"method": "listunspent", "params": [1, 6], "id": 10},
+                    {
+                        "method": "listunspent",
+                        "params": {"minconf": 1, "maxconf": 6},
+                        "id": 11
+                    }
+                ]))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = build_handler_router(state).oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body[0]["result"], "positional");
+        assert_eq!(body[1]["result"], "named");
+    }
+
+    #[tokio::test]
+    async fn wallet_core_error_code_and_message_are_preserved() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wallet/missing"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "result": null,
+                "error": {"code": -18, "message": "Requested wallet does not exist"},
+                "id": 0
+            })))
+            .mount(&mock_server)
+            .await;
+        let state = Arc::new(BitcoinRpcState {
+            client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
+            max_batch_size: 20,
+            wallet_rpc_enabled: true,
+            rpcuser: "unused".to_string(),
+            rpcpassword: "unused".to_string(),
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/wallet/missing/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"method": "getwalletinfo", "params": [], "id": 1}))
+                    .unwrap(),
+            ))
+            .unwrap();
+
+        let response = build_handler_router(state).oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], -18);
+        assert_eq!(body["error"]["message"], "Requested wallet does not exist");
+    }
+
+    #[tokio::test]
+    async fn wallet_endpoint_requires_authentication() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let state = Arc::new(BitcoinRpcState {
+            client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
+            max_batch_size: 20,
+            wallet_rpc_enabled: true,
+            rpcuser: "user".to_string(),
+            rpcpassword: "password".to_string(),
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/wallet/trading/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"method": "getwalletinfo", "params": [], "id": 1}))
+                    .unwrap(),
+            ))
+            .unwrap();
+
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -575,6 +993,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -627,6 +1046,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -704,6 +1124,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -754,6 +1175,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -819,6 +1241,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -869,6 +1292,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -930,6 +1354,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -961,6 +1386,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new("http://127.0.0.1:1", "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -995,6 +1421,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new("http://127.0.0.1:1", "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1061,6 +1488,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1119,6 +1547,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1164,6 +1593,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1193,6 +1623,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new("http://127.0.0.1:1", "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1219,6 +1650,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new("http://127.0.0.1:1", "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1250,6 +1682,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new("http://127.0.0.1:1", "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1280,6 +1713,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new("http://127.0.0.1:1", "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1313,6 +1747,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new("http://127.0.0.1:1", "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1344,6 +1779,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1379,6 +1815,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });
@@ -1410,6 +1847,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "user".to_string(),
             rpcpassword: "pass".to_string(),
         });
@@ -1432,6 +1870,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new("http://127.0.0.1:1", "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "user".to_string(),
             rpcpassword: "pass".to_string(),
         });
@@ -1461,6 +1900,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new("http://127.0.0.1:1", "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "user".to_string(),
             rpcpassword: "pass".to_string(),
         });
@@ -1500,6 +1940,7 @@ mod tests {
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 20,
+            wallet_rpc_enabled: false,
             rpcuser: "alice".to_string(),
             rpcpassword: "secret".to_string(),
         });
@@ -1749,11 +2190,160 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a disposable Bitcoin Core regtest node with wallet support"]
+    async fn wallet_regtest_lifecycle_matches_bitcoin_core() {
+        const SETUP: &str = "set P2POOL_REGTEST_RPC_URL, P2POOL_REGTEST_RPC_USERNAME, and P2POOL_REGTEST_RPC_PASSWORD to run this ignored test";
+        const GATEWAY_USERNAME: &str = "wallet-contract-user";
+        const GATEWAY_PASSWORD: &str = "wallet-contract-password";
+
+        let upstream_url = env::var("P2POOL_REGTEST_RPC_URL").expect(SETUP);
+        let upstream_username = env::var("P2POOL_REGTEST_RPC_USERNAME").expect(SETUP);
+        let upstream_password = env::var("P2POOL_REGTEST_RPC_PASSWORD").expect(SETUP);
+        let upstream_client =
+            BitcoindRpcClient::new(&upstream_url, &upstream_username, &upstream_password)
+                .expect("failed to build the direct Bitcoin Core client");
+        let blockchain_info = upstream_client
+            .call_value("getblockchaininfo", None)
+            .await
+            .expect("failed to query Bitcoin Core");
+        assert_eq!(blockchain_info["chain"], "regtest");
+
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is before the Unix epoch")
+            .as_nanos();
+        let wallet_name = format!("p2poolv2-wallet-contract-{unique_suffix}");
+        let gateway_config = BitcoinRpcApiConfig {
+            enabled: true,
+            wallet_rpc_enabled: true,
+            port: Some(0),
+            rpcuser: Some(GATEWAY_USERNAME.to_string()),
+            rpcpassword: Some(GATEWAY_PASSWORD.to_string()),
+            ..BitcoinRpcApiConfig::default()
+        };
+        let upstream_config = BitcoinRpcConfig {
+            url: upstream_url,
+            username: upstream_username,
+            password: upstream_password,
+        };
+        let (shutdown_sender, server_handle, gateway_port) =
+            start_bitcoin_rpc_server(gateway_config, &upstream_config)
+                .await
+                .expect("failed to start the wallet RPC gateway");
+        let gateway_client = BitcoindRpcClient::new(
+            &format!("http://127.0.0.1:{gateway_port}"),
+            GATEWAY_USERNAME,
+            GATEWAY_PASSWORD,
+        )
+        .expect("failed to build the gateway client");
+
+        let created_wallet = gateway_client
+            .call_value("createwallet", Some(json!({"wallet_name": wallet_name})))
+            .await
+            .expect("createwallet failed through the gateway");
+        assert_eq!(created_wallet["name"], wallet_name);
+
+        gateway_client
+            .call_value("unloadwallet", Some(json!([wallet_name])))
+            .await
+            .expect("unloadwallet failed after creation");
+        let loaded_wallet = gateway_client
+            .call_value("loadwallet", Some(json!([wallet_name])))
+            .await
+            .expect("loadwallet failed through the gateway");
+        assert_eq!(loaded_wallet["name"], wallet_name);
+
+        let wallet_descriptors = upstream_client
+            .call_value_for_wallet("listdescriptors", Some(json!([true])), &wallet_name)
+            .await
+            .expect("failed to read the disposable wallet descriptors");
+        let descriptor = wallet_descriptors["descriptors"][0]["desc"]
+            .as_str()
+            .expect("listdescriptors did not return a private descriptor");
+        let imported_descriptors = gateway_client
+            .call_value_for_wallet(
+                "importdescriptors",
+                Some(json!([[{
+                    "desc": descriptor,
+                    "timestamp": "now",
+                    "range": [0, 1000]
+                }]])),
+                &wallet_name,
+            )
+            .await
+            .expect("importdescriptors failed through the wallet endpoint");
+        assert_eq!(
+            imported_descriptors[0]["success"], true,
+            "unexpected importdescriptors result: {imported_descriptors}"
+        );
+
+        let mining_address = upstream_client
+            .call_value_for_wallet("getnewaddress", None, &wallet_name)
+            .await
+            .expect("failed to obtain a regtest mining address");
+        upstream_client
+            .call_value("generatetoaddress", Some(json!([101, mining_address])))
+            .await
+            .expect("failed to mine mature wallet funds");
+        let rescan = gateway_client
+            .call_value_for_wallet(
+                "rescanblockchain",
+                Some(json!({"start_height": 0})),
+                &wallet_name,
+            )
+            .await
+            .expect("rescanblockchain failed through the wallet endpoint");
+        assert_eq!(rescan["start_height"], 0);
+
+        let unspent_outputs = gateway_client
+            .call_value_for_wallet("listunspent", Some(json!([101])), &wallet_name)
+            .await
+            .expect("listunspent failed through the wallet endpoint");
+        let spendable_output = &unspent_outputs[0];
+        assert_eq!(spendable_output["spendable"], true);
+        let raw_transaction = gateway_client
+            .call_value_for_wallet(
+                "createrawtransaction",
+                Some(json!([
+                    [{
+                        "txid": spendable_output["txid"],
+                        "vout": spendable_output["vout"]
+                    }],
+                    {"data": "00"}
+                ])),
+                &wallet_name,
+            )
+            .await
+            .expect("createrawtransaction failed through the wallet endpoint");
+        let signed_transaction = gateway_client
+            .call_value_for_wallet(
+                "signrawtransactionwithwallet",
+                Some(json!([raw_transaction])),
+                &wallet_name,
+            )
+            .await
+            .expect("signrawtransactionwithwallet failed through the wallet endpoint");
+        assert_eq!(signed_transaction["complete"], true);
+
+        gateway_client
+            .call_value("unloadwallet", Some(json!([wallet_name])))
+            .await
+            .expect("final unloadwallet failed through the gateway");
+        shutdown_sender
+            .send(())
+            .expect("wallet RPC gateway stopped before test shutdown");
+        server_handle
+            .await
+            .expect("failed to join wallet RPC gateway task");
+    }
+
+    #[tokio::test]
     async fn oversized_batch_is_rejected() {
         let mock_server = MockServer::start().await;
         let state = Arc::new(BitcoinRpcState {
             client: BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap(),
             max_batch_size: 2,
+            wallet_rpc_enabled: false,
             rpcuser: "unused".to_string(),
             rpcpassword: "unused".to_string(),
         });

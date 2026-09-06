@@ -5,9 +5,9 @@ in `[bitcoinrpc]`. The gateway does not answer from the P2Poolv2 share chain and
 is not a P2Poolv2-native Bitcoin chain backend. It forwards an allowlisted set
 of calls to that upstream Bitcoin Core node and returns the upstream results.
 
-This is not an Electrum server, an Esplora API, or an NBXplorer API. It exposes
-only `POST /`, has no wallet endpoint, and is not a drop-in replacement for
-those protocols or for Bitcoin Core's complete RPC interface.
+This is not an Electrum server, an Esplora API, or an NBXplorer API, and it is
+not a drop-in replacement for those protocols or for Bitcoin Core's complete
+RPC interface. Wallet RPCs and wallet endpoints are separately opt-in.
 
 ## Configuration
 
@@ -21,6 +21,7 @@ password = "replace-with-upstream-password"
 
 [bitcoin_rpc_api]
 enabled = true
+wallet_rpc_enabled = false
 host = "127.0.0.1"
 port = 18332
 rpcuser = "gateway-user"
@@ -33,10 +34,12 @@ The `[bitcoinrpc]` credentials authenticate P2Poolv2 to the upstream
 read Bitcoin Core's cookie file. The `[bitcoin_rpc_api]` credentials are a
 separate pair that clients use to authenticate to this gateway.
 
-The gateway is disabled by default. When enabled, `port`, `rpcuser`, and
-`rpcpassword` are required and must be non-empty. `host` defaults to
-`127.0.0.1`, and `max_batch_size` defaults to 20 and must be greater than zero.
-Configuration is rejected at startup if these requirements are not met.
+The gateway and its wallet RPC extension are both disabled by default. The
+wallet setting has no effect unless the gateway is enabled. When the gateway
+is enabled, `port`, `rpcuser`, and `rpcpassword` are required and must be
+non-empty. `host` defaults to `127.0.0.1`, and `max_batch_size` defaults to 20
+and must be greater than zero. Configuration is rejected at startup if these
+requirements are not met.
 
 The listener participates in normal P2Poolv2 shutdown: the node signals the
 gateway, and the HTTP server stops gracefully.
@@ -84,6 +87,14 @@ The gateway credentials protect access only to the gateway. The upstream
 credentials remain in `[bitcoinrpc]` and are used for the gateway's calls to
 Bitcoin Core.
 
+Enabling `wallet_rpc_enabled` grants authenticated gateway clients access to
+wallet creation, descriptor import, rescanning, transaction creation, and
+wallet signing. A client can use these operations to spend funds and alter
+wallet state. HTTP authentication and the method allowlist are not substitutes
+for host security. Run the gateway, Bitcoin Core, and wallet clients with
+system-level isolation such as dedicated operating-system users, containers,
+or virtual machines, and expose the listener only to trusted clients.
+
 ## Supported v1 methods
 
 Gateway v1 exposes exactly these 16 methods:
@@ -107,9 +118,44 @@ Gateway v1 exposes exactly these 16 methods:
 | `testmempoolaccept` | Test transaction acceptance without submission |
 | `decoderawtransaction` | Decode raw transaction hex |
 
-Every other method, including wallet RPCs, returns code `-32601` (method not
-found). The allowlist is a security and scope boundary, not evidence that a
-downstream application is compatible.
+Every other method returns code `-32601` (method not found). The allowlist is a
+security and scope boundary, not evidence that a downstream application is
+compatible.
+
+## Optional wallet RPCs
+
+Set `wallet_rpc_enabled = true` only in an isolated, trusted deployment. This
+adds exactly these 13 methods without changing the 16-method v1 allowlist:
+
+| Method | Forwarded operation |
+|---|---|
+| `createrawtransaction` | Create an unsigned transaction |
+| `createwallet` | Create and load a Bitcoin Core wallet |
+| `getbalance` | Return the wallet balance |
+| `getbalances` | Return detailed wallet balances |
+| `gettransaction` | Return a wallet transaction |
+| `getwalletinfo` | Return wallet state |
+| `importdescriptors` | Import wallet descriptors |
+| `listunspent` | Return wallet unspent outputs |
+| `listwallets` | Return loaded wallets |
+| `loadwallet` | Load a Bitcoin Core wallet |
+| `rescanblockchain` | Rescan blocks for wallet transactions |
+| `signrawtransactionwithwallet` | Sign transaction inputs with wallet keys |
+| `unloadwallet` | Unload a Bitcoin Core wallet |
+
+When wallet RPCs are disabled, these methods return `-32601` at `/` and wallet
+paths return HTTP 404. When enabled, clients may use either `/` or
+`/wallet/<walletname>/`. The wallet endpoint accepts the 16 v1 methods as well
+as the 13 wallet methods, matching Bitcoin Core's ability to serve non-wallet
+calls on a wallet endpoint. The gateway also accepts the endpoint without its
+final slash for existing clients.
+
+Wallet calls made at `/` remain root-endpoint calls. Bitcoin Core can serve a
+wallet call there when exactly one wallet is loaded and remains responsible
+for rejecting ambiguous or invalid wallet selection. A wallet name received
+in the URL is decoded and then encoded as one upstream URL path segment; it
+cannot add path separators or escape the wallet endpoint. Empty wallet names
+and the URL dot segments `.` and `..` are not forwarded.
 
 ## Request and response formats
 
@@ -218,15 +264,16 @@ the end-to-end results recorded below support a compatibility status.
 
 | Software | Status | Version or commit | Scope and limitations |
 |---|---|---|---|
-| Bitcoin Core | Tested | 31.1.0; `bitcoin/bitcoin@sha256:da25cedc66b1daefff9f412ee196c901a899c3fa68a33b20849c3e08b5c40d63` | The ignored live-regtest contract passed for scalar, hex, object, nullable, Core error, `testmempoolaccept`, `sendrawtransaction`, batch, and notification behavior. This does not test every allowed method or make the gateway a complete Core RPC implementation. |
+| Bitcoin Core | Tested | 31.1.0; `bitcoin/bitcoin@sha256:da25cedc66b1daefff9f412ee196c901a899c3fa68a33b20849c3e08b5c40d63` | The ignored live-regtest contracts passed for scalar, hex, object, nullable, Core error, `testmempoolaccept`, `sendrawtransaction`, batch, notification, and the wallet create/load/import/rescan/list/create/sign/unload lifecycle. This does not test every allowed method or make the gateway a complete Core RPC implementation. |
 | LND | Partially tested | 0.21.1-beta, commit `2b8788`; `lightninglabs/lnd@sha256:4af8f9bbf98c8b86b0e54b065d6ea45d1387256a43fa9270c11ef849511abae0` | In RPC-polling mode, LND connected through the gateway to Core 31.1 and started block and mempool polling at height 101. Full startup then failed because LND requires `getdeploymentinfo`, which v1 does not allow. LND is therefore not compatible with this v1 gateway. Its normal ZMQ mode was not tested. |
 | CLN | Partially tested | 26.06.6; `elementsproject/lightningd@sha256:094be3630f865c795649d6063a8796afa0f78e82a0c311bb34f2b0bd570c819a` | The default `bcli` backend connected through the gateway to Core 31.1, synchronized to regtest height 101, and `lightning-cli getinfo` succeeded. Channel opening, transaction broadcast, fee updates, rescans, and long-running operation were not tested. |
-| CoinSwap | Not tested | None | No CoinSwap implementation, release, or commit has been selected or tested. |
+| CoinSwap | Not tested | `bitcoin-teleport/teleport-transactions` commit `a52b4d77ddb5599c28c6de9952789b9737b8899d` | Source inspection found `bitcoincore-rpc` 0.13 positional parameter arrays, a fixed `/wallet/teleport` endpoint, and Bitcoin Core 0.21.1 in its CI. It also requires RPCs outside this gateway's allowlists, including `deriveaddresses`, `getaddressinfo`, `getdescriptorinfo`, `importmulti`, `importprunedfunds`, `lockunspent`, `scantxoutset`, and `walletcreatefundedpsbt`. No integration was run, and this target is not compatible with the optional wallet allowlist. |
 | Ark | Not tested | None | No Ark implementation, release, or commit has been selected or tested. |
 
 ## Official references
 
 - [Bitcoin Core 31.1 JSON-RPC interface](https://github.com/bitcoin/bitcoin/blob/v31.1/doc/JSON-RPC-interface.md)
+- [Bitcoin Core 31.1 wallet management and security](https://github.com/bitcoin/bitcoin/blob/v31.1/doc/managing-wallets.md)
 - [Bitcoin Core 31.1 `bitcoind` server default](https://github.com/bitcoin/bitcoin/blob/v31.1/src/bitcoind.cpp)
 - [Bitcoin Core 31.1 `getrawtransaction` implementation](https://github.com/bitcoin/bitcoin/blob/v31.1/src/rpc/rawtransaction.cpp)
 - [Bitcoin Core 31.1 `getblockfilter` implementation](https://github.com/bitcoin/bitcoin/blob/v31.1/src/rpc/blockchain.cpp)
@@ -234,3 +281,5 @@ the end-to-end results recorded below support a compatibility status.
 - [LND 0.21.1-beta sample configuration for ZMQ and RPC polling](https://github.com/lightningnetwork/lnd/blob/v0.21.1-beta/sample-lnd.conf)
 - [Core Lightning Bitcoin Core backend](https://docs.corelightning.org/docs/bitcoin-core)
 - [Core Lightning Bitcoin backend plugin interface](https://docs.corelightning.org/docs/bitcoin-backend)
+- [Teleport Transactions pinned CoinSwap source](https://github.com/bitcoin-teleport/teleport-transactions/tree/a52b4d77ddb5599c28c6de9952789b9737b8899d)
+- [Teleport Transactions Bitcoin Core 0.21.1 CI configuration](https://github.com/bitcoin-teleport/teleport-transactions/blob/a52b4d77ddb5599c28c6de9952789b9737b8899d/.github/workflows/coverage.yaml)

@@ -538,6 +538,9 @@ pub struct BitcoinRpcApiConfig {
     /// Enable the proxy endpoint (default: false)
     #[serde(default)]
     pub enabled: bool,
+    /// Allow wallet RPC methods and wallet-specific endpoints (default: false)
+    #[serde(default)]
+    pub wallet_rpc_enabled: bool,
     /// Bind host for the proxy listener
     #[serde(default = "default_bitcoin_rpc_host")]
     pub host: String,
@@ -556,6 +559,7 @@ impl std::fmt::Debug for BitcoinRpcApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BitcoinRpcApiConfig")
             .field("enabled", &self.enabled)
+            .field("wallet_rpc_enabled", &self.wallet_rpc_enabled)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("rpcuser", &self.rpcuser)
@@ -569,6 +573,7 @@ impl Default for BitcoinRpcApiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            wallet_rpc_enabled: false,
             host: default_bitcoin_rpc_host(),
             port: None,
             rpcuser: None,
@@ -1147,6 +1152,7 @@ mod tests {
         let config = BitcoinRpcApiConfig::default();
 
         assert!(!config.enabled);
+        assert!(!config.wallet_rpc_enabled);
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, None);
         assert!(config.validate().is_ok());

@@ -149,6 +149,46 @@ impl BitcoindRpcClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, BitcoindRpcError> {
+        self.call_value_at_url(&self.url, method, params).await
+    }
+
+    /// Forwards a Bitcoin RPC call to a named wallet endpoint.
+    ///
+    /// Empty wallet names and URL dot segments are rejected.
+    pub async fn call_value_for_wallet(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        wallet_name: &str,
+    ) -> Result<serde_json::Value, BitcoindRpcError> {
+        if wallet_name.is_empty() || matches!(wallet_name, "." | "..") {
+            return Err(BitcoindRpcError::Other(
+                "Wallet name cannot be an empty or dot URL path segment".to_string(),
+            ));
+        }
+
+        let mut wallet_url = reqwest::Url::parse(&self.url).map_err(|error| {
+            BitcoindRpcError::Other(format!("Invalid Bitcoin RPC URL: {error}"))
+        })?;
+        wallet_url
+            .path_segments_mut()
+            .map_err(|_| {
+                BitcoindRpcError::Other("Bitcoin RPC URL cannot be a base URL".to_string())
+            })?
+            .pop_if_empty()
+            .push("wallet")
+            .push(wallet_name);
+
+        self.call_value_at_url(wallet_url.as_str(), method, params)
+            .await
+    }
+
+    async fn call_value_at_url(
+        &self,
+        url: &str,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, BitcoindRpcError> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
 
         let request = JsonRpcRequest {
@@ -157,7 +197,7 @@ impl BitcoindRpcClient {
             id,
         };
 
-        let response = match self.client.post(&self.url).json(&request).send().await {
+        let response = match self.client.post(url).json(&request).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 let status_code = e.status().map(|s| s.as_u16());
@@ -750,6 +790,43 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_call_value_for_wallet_encodes_one_path_segment() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/wallet/..%2Fhot%20wallet%25"))
+            .and(body_json(serde_json::json!({
+                "method": "getwalletinfo",
+                "params": [],
+                "id": 0
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": true,
+                "error": null,
+                "id": 0
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap();
+        let dot_segment_error = client
+            .call_value_for_wallet("getwalletinfo", Some(serde_json::json!([])), "..")
+            .await
+            .unwrap_err();
+        let result = client
+            .call_value_for_wallet(
+                "getwalletinfo",
+                Some(serde_json::json!([])),
+                "../hot wallet%",
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(dot_segment_error, BitcoindRpcError::Other(_)));
         assert_eq!(result, serde_json::json!(true));
     }
 
